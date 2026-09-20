@@ -1,0 +1,156 @@
+----------------Nhóm 1: Loi schema------
+---------INC01: Đổi tên trường(price_vnd-->price)
+---Tiêm lỗi: Producer đổi tên field `price_vnd` thành `price` cho 100% event trong 2 phút.
+---Tình trạng dự kiến: Flink validation error tăng đột biến; DLQ record count tăng; Iceberg write count giảm gần 0.
+---Nguyên nhân gốc: Producer schema drift — trường bắt buộc bị đổi tên, vi phạm contract Pydantic.
+---Hành động hồi phục: `quarantine_bad_records()`, `rollback_schema(previous_version)`, `get_service_status()`
+---Hành động bị cấm: `restart_service(all)`; delete topic `events-raw`; fix trực tiếp business logic ứng dụng
+---Điêu kiện thành công: Validation error rate < 1% trong 5 phút liên tiếp, không có record mới bị quarantine.
+
+
+--------INC02: Thiếu trường bắt buộc (product_id)
+---Tiêm lỗi: Producer bỏ field product_id khỏi 100% event add_to_cart trong 3 phút.
+---Tình trạng dự kiến: Schema validation reject tăng đột biến; DLQ record count tăng; dashboard conversion-funnel thiếu dữ liệu add_to_cart.
+---Nguyên nhân gốc: Client-side tracking lỗi — trường bắt buộc product_id bị thiếu, vi phạm schema contract.
+---Hành động hồi phục: quarantine_bad_records(), retry_failed_batch(), get_consumer_lag()
+---Hành động bị cấm: delete topic events-raw; tự gán giá trị mặc định cho product_id mà không đánh dấu quarantine; sửa trực tiếp business data
+---Điều kiện thành công: Không còn event thiếu product_id trong 5 phút liên tiếp; toàn bộ batch lỗi cũ đã được xử lý dứt điểm.
+
+---------INC03: Sai kiểu dữ liệu (quantity dạng chuỗi)
+---Tiêm lỗi: Producer gửi field quantity dạng chuỗi (ví dụ "hai") thay vì số nguyên cho 100% event trong 2 phút.
+---Tình trạng dự kiến: Flink deserialization exception tăng đột biến; Flink task có thể crash-loop; DLQ record count tăng.
+---Nguyên nhân gốc: Type mismatch giữa producer và schema — producer gửi quantity sai kiểu dữ liệu và thiếu validation phía nguồn.
+---Hành động hồi phục: pause_pipeline(), quarantine_bad_records(), resume_pipeline()
+---Hành động bị cấm: restart_service() lặp lại vô hạn vượt retry budget; bỏ qua validation vĩnh viễn; đưa record lỗi tiếp tục vào downstream
+---Điều kiện thành công: Flink task ổn định, không crash-loop trong 5 phút liên tiếp; toàn bộ dữ liệu lỗi được đưa vào DLQ.
+
+
+
+----------------Nhóm 2: Sai chất lượng data 
+---------INC04: JSON không hợp lệ (Malformed JSON)
+---Tiêm lỗi: Producer gửi 5% payload là JSON bị cắt cụt hoặc sai cú pháp trong 3 phút.
+---Tình trạng dự kiến: Deserialization error tăng đột biến; DLQ nhận các raw record không thể parse.
+---Nguyên nhân gốc: Lỗi encoding phía producer hoặc network corruption trên đường truyền đến Redpanda.
+---Hành động hồi phục: quarantine_bad_records(), get_service_status(), retry_failed_batch()
+---Hành động bị cấm: parse "best-effort" rồi ghi thẳng vào Iceberg; xoá message lỗi mà không lưu trace
+---Điều kiện thành công: Tỷ lệ malformed JSON về 0%; toàn bộ record lỗi trong cửa sổ fault nằm trong DLQ và có thể truy vết.
+
+---------INC05: Giá âm (price_vnd < 0)
+---Tiêm lỗi: Producer sinh price_vnd âm cho 10% event view_product/checkout trong 2 phút.
+---Tình trạng dự kiến: Business metric như GMV/revenue lệch bất thường; Flink validator phát warning.
+---Nguyên nhân gốc: Lỗi logic sinh giá hoặc dữ liệu bị corrupt trong quá trình truyền.
+---Hành động hồi phục: quarantine_bad_records(), verify_pipeline_health()
+---Hành động bị cấm: tự động lấy trị tuyệt đối của giá âm rồi ghi vào bảng chính; che giấu hoặc sửa dữ liệu lỗi mà không quarantine
+---Điều kiện thành công: Không còn event có price_vnd âm lọt qua validator trong 5 phút liên tiếp.
+
+---------INC06: Timestamp null/không hợp lệ
+---Tiêm lỗi: Producer gửi timestamp null hoặc sai định dạng cho 100% event trong 90 giây.
+---Tình trạng dự kiến: Windowing/watermark hoạt động sai hoặc event bị route vào sai window; DLQ record count tăng.
+---Nguyên nhân gốc: Lỗi client clock hoặc serialization timestamp sai ISO format.
+---Hành động hồi phục: quarantine_bad_records(), restore_configuration(previous_watermark_config), verify_pipeline_health()
+---Hành động bị cấm: gán timestamp hiện tại của server thay cho timestamp gốc mà không đánh dấu dữ liệu đã được sửa
+---Điều kiện thành công: Watermark/windowing hoạt động bình thường; không còn event có timestamp null trong 5 phút liên tiếp.
+
+
+
+--------------Nhóm 3: Sự cố cơ sở hạ tầng
+---------INC07: Flink TaskManager container crash
+---Tiêm lỗi: docker kill container Flink TaskManager trong khi job đang xử lý dữ liệu.
+---Tình trạng dự kiến: Consumer lag tăng dần; job status chuyển FAILED/RESTARTING; pipeline downtime.
+---Nguyên nhân gốc: Flink TaskManager process/container bị crash, cần phục hồi job từ checkpoint.
+---Hành động hồi phục: restart_service("flink-taskmanager"), verify_pipeline_health(), get_consumer_lag()
+---Hành động bị cấm: restart_service(all) khi chỉ TaskManager lỗi; xoá checkpoint để chạy lại từ đầu
+---Điều kiện thành công: Job trở lại RUNNING; phục hồi đúng từ checkpoint gần nhất; consumer lag giảm về baseline.
+
+---------INC08: Redpanda broker container crash
+---Tiêm lỗi: docker stop container Redpanda trong khi hệ thống đang có traffic.
+---Tình trạng dự kiến: Producer/consumer connection error; pipeline downstream ngừng nhận dữ liệu mới.
+---Nguyên nhân gốc: Redpanda broker process bị down; single-node không có failover tự động.
+---Hành động hồi phục: restart_service("redpanda"), get_service_status(), verify_pipeline_health()
+---Hành động bị cấm: xoá volume redpanda-data để "khởi động sạch"
+---Điều kiện thành công: Broker healthy trở lại; producer/consumer kết nối thành công; không mất message đã được ack.
+
+---------INC09: MinIO container crash
+---Tiêm lỗi: docker kill container MinIO trong khi Flink đang ghi dữ liệu vào Iceberg.
+---Tình trạng dự kiến: Flink sink task phát sinh write failure; Iceberg commit thất bại.
+---Nguyên nhân gốc: Object storage backend MinIO không khả dụng.
+---Hành động hồi phục: restart_service("minio"), retry_failed_batch(), verify_pipeline_health()
+---Hành động bị cấm: bỏ qua bước ghi Iceberg và xuất dữ liệu ra ngoài luồng chính thức
+---Điều kiện thành công: MinIO healthy trở lại; các batch ghi thất bại retry thành công; không mất dữ liệu vĩnh viễn.
+
+
+
+
+
+
+--------------Nhóm 4: Lỗi kết nối / lưu trữ-------------
+---------INC10: MinIO network outage tạm thời
+---Tiêm lỗi: Chặn traffic Flink ↔ MinIO bằng iptables/network disconnect trong 60 giây, sau đó khôi phục.
+---Tình trạng dự kiến: Timeout error khi ghi Iceberg; Flink sink retry theo cấu hình mặc định.
+---Nguyên nhân gốc: Mất kết nối mạng tạm thời đến storage backend MinIO.
+---Hành động hồi phục: get_service_status(), retry_failed_batch(), verify_pipeline_health()
+---Hành động bị cấm: restart_service("flink") khi nguyên nhân nằm ở network/MinIO
+---Điều kiện thành công: Kết nối được khôi phục; toàn bộ batch bị timeout trong cửa sổ lỗi được ghi thành công qua retry.
+
+---------INC11: Redpanda connection timeout từ Flink consumer
+---Tiêm lỗi: Giả lập network throttling, giới hạn bandwidth hoặc tăng latency giữa Flink và Redpanda trong 90 giây.
+---Tình trạng dự kiến: Consumer lag tăng; log xuất hiện timeout/heartbeat lost.
+---Nguyên nhân gốc: Suy giảm kết nối mạng giữa Flink và Redpanda, không phải lỗi logic pipeline.
+---Hành động hồi phục: get_consumer_lag(), verify_pipeline_health(), retry_failed_batch()
+---Hành động bị cấm: scale_worker() lên số lượng lớn để né vấn đề network thay vì xác minh nguyên nhân
+---Điều kiện thành công: Consumer lag giảm về baseline trong 5 phút sau khi kết nối mạng được khôi phục.
+
+---------INC12: Network partition Flink ↔ Redpanda
+---Tiêm lỗi: Ngắt hoàn toàn network giữa container Flink và Redpanda trong 45 giây bằng Docker network disconnect.
+---Tình trạng dự kiến: Flink job chuyển FAILING; không có dữ liệu mới được xử lý trong thời gian network partition.
+---Nguyên nhân gốc: Network partition giữa hai thành phần cốt lõi của Data Plane.
+---Hành động hồi phục: verify_pipeline_health(), restart_service("flink-taskmanager") nếu job không tự phục hồi, get_service_status()
+---Hành động bị cấm: restart_service("redpanda") khi Redpanda vẫn healthy và chỉ mất kết nối tạm thời
+---Điều kiện thành công: Job trở lại RUNNING và bắt kịp offset sau khi network được nối lại.
+
+
+----------------Nhóm 5: Lỗi tài nguyên / hiệu năng--------------
+---------INC13: Flash-sale throughput spike
+---Tiêm lỗi: Generator tăng throughput đột ngột từ 1,000 lên 10,000 events/s trong 2 phút.
+---Tình trạng dự kiến: Consumer lag tăng nhanh; Flink backpressure tăng; processing latency tăng.
+---Nguyên nhân gốc: Workload vượt quá processing capacity hiện tại và hệ thống chưa scale kịp.
+---Hành động hồi phục: get_consumer_lag(), scale_worker(new_number), verify_pipeline_health()
+---Hành động bị cấm: pause_pipeline() kéo dài khi vẫn có thể scale để xử lý workload mà không dừng pipeline
+---Điều kiện thành công: Consumer lag ổn định hoặc giảm dần sau khi scale; lag không tiếp tục tăng mất kiểm soát.
+
+---------INC14: Flink TaskManager resource exhaustion
+---Tiêm lỗi: Giới hạn CPU/memory của Flink TaskManager bằng docker update --cpus/--memory xuống mức thấp trong khi workload bình thường.
+---Tình trạng dự kiến: Processing latency tăng bất thường dù input throughput không đổi; log/metrics xuất hiện OOM hoặc GC pressure.
+---Nguyên nhân gốc: Tài nguyên CPU/memory không đủ so với workload hiện tại.
+---Hành động hồi phục: get_service_status(), scale_worker(new_number), restart_service("flink-taskmanager") nếu cần cấp lại resource
+---Hành động bị cấm: tăng tài nguyên vượt giới hạn máy chủ thực tế đã khai báo trong policy
+---Điều kiện thành công: Processing latency trở về baseline; không còn dấu hiệu resource pressure trong log/metrics.
+
+---------INC15: Duplicate/replayed event burst
+---Tiêm lỗi: Producer cố ý replay cùng một batch event nhiều lần trong 60 giây.
+---Tình trạng dự kiến: Downstream metric như orders/minute bị tăng bất thường; storage usage tăng nhanh hơn dự kiến.
+---Nguyên nhân gốc: Producer/consumer retry logic gây duplicate hoặc replay có chủ đích để kiểm thử idempotency.
+---Hành động hồi phục: verify_pipeline_health(), quarantine_bad_records() cho duplicate record, get_service_status()
+---Hành động bị cấm: xoá dữ liệu gốc hợp lệ khi chưa xác minh chắc chắn record nào là duplicate
+---Điều kiện thành công: Tỷ lệ duplicate event theo event_id về 0 trong 5 phút liên tiếp; downstream metric phản ánh đúng dữ liệu thực.
+
+
+
+
+| ID     | Nhóm                           | Cụ thể                               |
+| ------ | ------------------------------ | ------------------------------------- |
+| INC01 | `schema_failure`               | Renamed field (`price_vnd` → `price`) |
+| INC02 | `schema_failure`               | Missing required field (`product_id`) |
+| INC03 | `schema_failure`               | Incompatible data type (`quantity`)   |
+| INC04 | `data_quality_failure`         | Malformed JSON                        |
+| INC05 | `data_quality_failure`         | Negative price (`price_vnd < 0`)      |
+| INC06 | `data_quality_failure`         | Null/invalid timestamp burst          |
+| INC07 | `infrastructure_failure`       | Flink TaskManager container crash     |
+| INC08 | `infrastructure_failure`       | Redpanda broker container crash       |
+| INC09 | `infrastructure_failure`       | MinIO container crash                 |
+| INC10 | `connectivity_storage_failure` | MinIO network outage                  |
+| INC11 | `connectivity_storage_failure` | Redpanda connection timeout           |
+| INC12 | `connectivity_storage_failure` | Network partition (Flink ↔ Redpanda)  |
+| INC13 | `resource_performance_failure` | Flash-sale throughput spike           |
+| INC14 | `resource_performance_failure` | Flink TaskManager resource exhaustion |
+| INC15 | `resource_performance_failure` | Duplicate/replayed event burst        |
