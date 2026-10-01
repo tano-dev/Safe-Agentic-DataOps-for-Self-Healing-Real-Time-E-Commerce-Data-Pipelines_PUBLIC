@@ -1,0 +1,40 @@
+####################Tuan 1 và 2:
+1/ Khởi động infrastucture(container)
+        docker compose up -d
+        docker compose ps        # đợi đến khi redpanda và minio hiện "healthy"
+
+2/ Tạo Redpanda topics:
+ -Topic là nơi Redpanda lưu dữ liệu theo luồng sự kiện, giống như “kênh/chủ đề” mà producer gửi dữ liệu vào và consumer đọc dữ liệu ra.
+        chmod +x scripts/create_topics.sh
+        ./scripts/create_topics.sh
+
+ -producer.py sẽ sinh dữ liệu sự kiện dữ liệu đó được gửi vào topic events-raw sau đó có thể có consumer hoặc pipeline xử lý tiếp
+ -redpanda giữ dữ liệu theo thời gian và theo partition, để nhiều consumer có thể đọc song song
+
+
+3/ pip install -r requirements.txt
+
+4/ sinh data (chỉ in ra console, chưa dung tơi Redpanda)
+        python generator.py --rate 20 --duration 30
+
+5/ push data den Redpanda
+        python producer.py --rate 100 --duration 60
+
+6/ kiem tra data da vao Redpanda hay chua
+        docker exec redpanda rpk topic consume events-raw --brokers 127.0.0.1:9092 --num 5
+        
+
+7/ MinIO(Rustfs)
+        Console: http://localhost:9001 (user `minioadmin` /pass `minioadmin123`)
+        Bucket `vietcommerceops-lakehouse` duoc auto tao ra boi service `minio-init`.
+
+///////////////////Xóa data: docker compose down -v 
+Chủn bị cho cac tuần sau:
+- Apache Flink (Tuần 3-4): đọc `events-raw`, validate, ghi vào Iceberg trên MinIO
+- Apache Iceberg catalog (Tuần 3-4)
+- Prometheus/Grafana observability (Tuần 5-7)
+- Script fault injection (Tuần 5-7)
+
+TNote: Airflow/dbt/OpenLineage/Grafana là optional extensions
+
+

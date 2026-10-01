@@ -1,0 +1,73 @@
+##########tuan3-4
+1/ khởi động infrastructure
+docker compose up -d --remove-orphans #xóa các container đang tồn tại nhưng không còn được khai báo trong file Compose hiện tại.
+
+docker compose ps 
+# Chờ Flink cài Python/PyFlink và mở REST API trước khi submit job.
+
+until curl -fsS http://localhost:8081/overview >/dev/null; do sleep 2; done
+
+# Nếu vừa recreate container, bước bootstrap có thể mất vài phút vì cài PyFlink
+# và tải các JAR Kafka/Iceberg/Hadoop trong docker-compose.yml.
+
+2/tao redpanda topics
+leejnh1: chmod +x scripts/create_topics.sh 
+
+lệnh 2: bash ./scripts/create_topics.sh  
+
+3/install requirement.txt
+python -m pip install -r requirements.txt
+
+
+4/ submit Flink job
+docker exec -it flink-jobmanager  /opt/flink/bin/flink run -d -py /opt/flink/usrlib/streaming_etl.py
+
+---> mở: localhost:8081 (Flink Web UI) de xac nhận job ở trạng thái running
+---> hoặc kiểm tra nhanh:
+docker exec flink-jobmanager /opt/flink/bin/flink list
+
+Job phải ở RUNNING và ổn định. Chỉ được có một job; 
+nếu thấy thêm job cũ thì:
+lệnh: flink cancel <job_id>.
+
+5/ geneerate va push data vao redpanda
+--------option:check schema->chỉ in ra console, không cần Redpanda đang chạy, không liên quan tới 2 bước tiếp:
+python generator.py --rate 20 --duration 30
+
+--------đay vao redpanda(workload normal):
+python producer.py --profile normal --rate 500 --duration 15
+
+--------day workload flash-sale(1000->2000>5000->10000 events/s):
+python producer.py --profile flash-sale --stage-duration 60 --workers 4
+
+
+6/ kiểm tra data
+-----redpanda
+docker exec redpanda rpk topic consume events-raw --brokers 127.0.0.1:9092 --num 5
+
+-----Chờ 30–60 giây (Iceberg chỉ commit mỗi lần checkpoint),rồi kiểm tra iceberg(xac nhanh pipeline chay E2E):
+python verify_iceberg.py --preview 20
+
+
+7/RustFS (S3-compatible storage thay MinIO)
+console===> http://localhost:9001 (minioadmin / minioadmin123)
+Bucket vietcommerceops-lakehouse được tạo tự động bởi service minio-init
+Dữ liệu Iceberg nằm dưới vietcommerceops-lakehouse/warehouse/raw/events/
+
+
+8/ dừng project
+docker compose down
+
+# Không dùng "down -v" nếu muốn giữ dữ liệu Redpanda/RustFS.
+# Chỉ dùng lệnh dưới đây khi muốn xóa toàn bộ dữ liệu local:
+docker compose down -v
+
+# Checkpoint để job có thể phục hồi (liên quan INC-07: Flink crash).
+#note: checkpoint đang lưu ở storage mặc định (JobManager), ko bền vững qua việc restart container==> sẽ chuyển sang lưu trên MinIO khi
+#làm chaos testing thật ở Tuần 5-7.
+
+
+##############chủn bị cho tuần 5-6-7:
+prometheus và granfa obverbility
+checkpoint finlk lưu trên minio(sẽ update khi làm chaos testing)
+quarantine/dlq đầy đủ cho data lỗi(tuần 34 flink job chỉ filter bỏ chưa route sang other table)

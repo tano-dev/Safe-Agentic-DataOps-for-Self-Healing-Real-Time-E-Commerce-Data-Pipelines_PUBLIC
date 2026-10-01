@@ -1,0 +1,230 @@
+
+# Redpanda+MinIO+MinIO initial--> w1-w2
+# Flink+Iceberg catalog ---> w3-w4
+
+networks:
+  vietcommerceops-net:
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  minio-data:
+
+services:
+
+  ###tuan 1-2
+  redpanda:
+    restart: unless-stopped
+    image: redpandadata/redpanda:v25.3.17
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      #redpanda lang nghe kafka api đang ở đâu, có 2 listener:
+          #Internal: 9092--->cho các container trong docker network kết nối,
+          #External: 19092-->cho các client ngoài docker network kết nối,
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092 
+
+      #--kafka-addr = Redpanda listen ở đâu
+      #--advertise-kafka-addr = Redpanda nói cho client rằng hãy kết nối lại bằng địa chỉ nào.
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      
+      #Pandaproxy là REST API cho Kafka/Redpanda.
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      
+      
+      #Schema Registry là nơi lưu trữ các schema của các message trong Kafka.
+      #Schema Registry giúp producer/consumer biết: "Message này có cấu trúc ntn?-->vd: có field nào, datatype nào, bắt buộc hay không?"
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      
+      #RPC = Remote Procedure Call:Đây là địa chỉ Redpanda dùng cho giao tiếp nội bộ giữa các node Redpanda.
+      #vd: redpanda node 1<--> redpanda node 2 <--> redpanda node 3
+      - --rpc-addr redpanda:33145
+      #cho Redpanda biết: if node khác wanna giao tiep RPC với tôi thì dùng địa chỉ này
+      - --advertise-rpc-addr redpanda:33145
+
+      #cho Redpanda biết: Chạy trong development/container mode
+      - --mode dev-container
+
+      #CPU/core mà Redpanda use
+      - --smp 1
+
+      #Quy định mức độ log--> ở mức info(show logs in4 thông thường), debug, warn, error, critical
+      - --default-log-level=info
+    ports:
+      - "19092:19092" #kafka apii, dung cho producer.py chay ngoai host
+      - "18081:18081" #schema resitry
+      - "18082:18082" #Pandaproxy(REST)
+      - "9644:9644"   #admin endpoint/prometheus metrics endpoint
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - vietcommerceops-net
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  
+
+  minio:
+    restart: unless-stopped
+    image: rustfs/rustfs:latest
+    container_name: minio
+    user: root
+    command: server --address :9000 --console-enable --console-address :9001 /data
+    environment:
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin123
+      RUSTFS_REGION: us-east-1
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Web console
+    volumes:
+      - minio-data:/data
+    networks:
+      - vietcommerceops-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  minio-init:
+    restart: "no"
+    image: amazon/aws-cli:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - vietcommerceops-net
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      AWS_DEFAULT_REGION: us-east-1
+    command: ["--endpoint-url", "http://minio:9000", "s3", "mb", "s3://vietcommerceops-lakehouse"]
+
+  ###tuan 3-4    
+  iceberg-rest:
+    restart: unless-stopped
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: iceberg-rest
+    depends_on:
+      minio:
+        condition: service_healthy
+
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://vietcommerceops-lakehouse/warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "8181:8181" # Iceberg REST API
+    networks:
+      - vietcommerceops-net
+
+
+  
+  flink-jobmanager:
+    restart: unless-stopped
+    image: flink:1.20.1-scala_2.12-java17
+    container_name: flink-jobmanager
+    # Cài Python/PyFlink + JAR connector ngay lúc container khởi động,
+    user: root
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        if ! command -v python3 >/dev/null 2>&1; then
+          apt-get update -y
+          apt-get install -y --no-install-recommends python3 python3-pip wget
+        fi
+        ln -sf /usr/bin/python3 /usr/bin/python
+        python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+        python3 -c "import pyflink, ruamel.yaml" 2>/dev/null || \
+          python3 -m pip install --no-cache-dir apache-flink==1.20.1 ruamel.yaml
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.4.0-1.20/flink-sql-connector-kafka-3.4.0-1.20.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.20/1.9.1/iceberg-flink-runtime-1.20-1.9.1.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.9.1/iceberg-aws-bundle-1.9.1.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.6/hadoop-common-3.3.6.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.6/hadoop-hdfs-client-3.3.6.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-auth/3.3.6/hadoop-auth-3.3.6.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/com/fasterxml/woodstox/woodstox-core/6.6.1/woodstox-core-6.6.1.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/codehaus/woodstox/stax2-api/4.2.2/stax2-api-4.2.2.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/commons/commons-configuration2/2.8.0/commons-configuration2-2.8.0.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/commons/commons-text/1.9/commons-text-1.9.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/hadoop/thirdparty/hadoop-shaded-guava/1.1.1/hadoop-shaded-guava-1.1.1.jar
+        exec /docker-entrypoint.sh jobmanager
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_started
+    ports:
+      - "8081:8081" # Flink Web UI: http://localhost:8081
+    environment:
+      environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      AWS_REGION: us-east-1
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+    volumes:
+      - ./flink-jobs:/opt/flink/usrlib
+    networks:
+      - vietcommerceops-net
+ 
+  flink-taskmanager:
+    restart: unless-stopped
+    image: flink:1.20.1-scala_2.12-java17
+    container_name: flink-taskmanager
+    user: root
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        if ! command -v python3 >/dev/null 2>&1; then
+          apt-get update -y
+          apt-get install -y --no-install-recommends python3 python3-pip wget
+        fi
+        ln -sf /usr/bin/python3 /usr/bin/python
+        python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+        python3 -c "import pyflink, ruamel.yaml" 2>/dev/null || \
+          python3 -m pip install --no-cache-dir apache-flink==1.20.1 ruamel.yaml
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.4.0-1.20/flink-sql-connector-kafka-3.4.0-1.20.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.20/1.9.1/iceberg-flink-runtime-1.20-1.9.1.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.9.1/iceberg-aws-bundle-1.9.1.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.6/hadoop-common-3.3.6.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.6/hadoop-hdfs-client-3.3.6.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-auth/3.3.6/hadoop-auth-3.3.6.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/com/fasterxml/woodstox/woodstox-core/6.6.1/woodstox-core-6.6.1.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/codehaus/woodstox/stax2-api/4.2.2/stax2-api-4.2.2.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/commons/commons-configuration2/2.8.0/commons-configuration2-2.8.0.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/commons/commons-text/1.9/commons-text-1.9.jar
+        wget -nc -q -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/apache/hadoop/thirdparty/hadoop-shaded-guava/1.1.1/hadoop-shaded-guava-1.1.1.jar
+        exec /docker-entrypoint.sh taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      AWS_REGION: us-east-1
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+    volumes:
+      - ./flink-jobs:/opt/flink/usrlib
+    networks:
+      - vietcommerceops-net
+ 
